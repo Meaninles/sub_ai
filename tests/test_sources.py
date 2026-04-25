@@ -9,17 +9,36 @@ from ai_discovery.sources import UnifiedSourceFetcher
 
 
 class _FakeHttpClient:
-    def __init__(self, html_by_url: dict[str, str], json_by_url: dict[str, dict] | None = None) -> None:
+    def __init__(
+        self,
+        html_by_url: dict[str, str],
+        json_by_url: dict[str, dict] | None = None,
+        post_json_by_url: dict[str, dict] | None = None,
+    ) -> None:
         self.html_by_url = html_by_url
         self.json_by_url = json_by_url or {}
+        self.post_json_by_url = post_json_by_url or {}
+        self.posted_json: list[dict[str, object]] = []
 
     def request(self, method: str, url: str, retries: int = 1):  # noqa: ARG002
         return SimpleNamespace(status=200, body=self.html_by_url[url], headers={}, final_url=url)
 
-    def get_json(self, url: str):  # pragma: no cover - not used in these tests
+    def get_json(self, url: str, headers: dict[str, str] | None = None, retries: int = 1):  # noqa: ARG002
         if url not in self.json_by_url:
             raise AssertionError(f"unexpected json request: {url}")
         return self.json_by_url[url]
+
+    def post_json(
+        self,
+        url: str,
+        payload: dict,
+        headers: dict[str, str] | None = None,
+        retries: int = 1,
+    ):  # noqa: ARG002
+        self.posted_json.append({"url": url, "payload": payload, "headers": headers or {}})
+        if url not in self.post_json_by_url:
+            raise AssertionError(f"unexpected post json request: {url}")
+        return self.post_json_by_url[url]
 
     def canonicalize_url(self, url: str) -> str:
         return url
@@ -161,20 +180,28 @@ class SourceParsingTests(unittest.TestCase):
             "https://www.reddit.com/r/SideProject/comments/def456/invoice_tool/",
         )
 
-    def test_indiehackers_products_extracts_only_product_cards(self) -> None:
+    def test_indiehackers_products_extracts_recently_updated_algolia_hits_and_caps_at_30(self) -> None:
         settings = self._settings()
-        html = """
-        <html><head><title>Products</title></head><body>
-          <header><a href="/products">Products</a><a href="/ideas">Ideas</a></header>
-          <main>
-            <section>
-              <div class="card"><a href="/products/fitbuild">FitBuild</a><p>AI workout planner</p></div>
-              <div class="card"><a href="/products/launchcat">LaunchCat</a><p>Launch tracking</p></div>
-            </section>
-          </main>
-        </body></html>
-        """
-        fetcher = UnifiedSourceFetcher(settings, _FakeHttpClient({"https://www.indiehackers.com/products": html}))
+        settings.fetch_limit_generic = 40
+        query_url = "https://N86T1R3OWZ-dsn.algolia.net/1/indexes/products/query"
+        hits = [
+            {
+                "productId": f"product-{index}",
+                "name": f"Product {index}",
+                "tagline": f"Tagline {index}",
+                "description": f"Description {index}",
+                "websiteUrl": f"https://product-{index}.example.com",
+            }
+            for index in range(35)
+        ]
+        fetcher = UnifiedSourceFetcher(
+            settings,
+            _FakeHttpClient(
+                {"https://www.indiehackers.com/products": "<html><title>Products</title></html>"},
+                post_json_by_url={query_url: {"hits": hits}},
+            ),
+        )
+        fetcher._enrich_indiehackers_candidate = lambda candidate: {}  # type: ignore[method-assign]
         profile = SourceProfile(
             source_id="ih_products",
             input_url="https://www.indiehackers.com/products",
@@ -188,42 +215,43 @@ class SourceParsingTests(unittest.TestCase):
 
         observations = fetcher.fetch(profile)
 
-        self.assertEqual(
-            [item.source_url for item in observations],
-            [
-                "https://www.indiehackers.com/products/fitbuild",
-                "https://www.indiehackers.com/products/launchcat",
-            ],
-        )
+        self.assertEqual(len(observations), 30)
+        self.assertEqual(observations[0].source_url, "https://www.indiehackers.com/product/product-0")
+        self.assertEqual(observations[-1].source_url, "https://www.indiehackers.com/product/product-29")
+        self.assertEqual(len(fetcher.http_client.posted_json), 1)
+        self.assertEqual(fetcher.http_client.posted_json[0]["url"], query_url)
+        self.assertEqual(fetcher.http_client.posted_json[0]["payload"], {"params": "hitsPerPage=30&page=0"})
 
-    def test_indiehackers_products_enrich_with_detail_page_context(self) -> None:
+    def test_indiehackers_products_enrich_with_product_payload_context(self) -> None:
         settings = self._settings()
-        listing_html = """
-        <html><head><title>Products</title></head><body>
-          <main>
-            <section>
-              <div class="card"><a href="/products/fitbuild">FitBuild</a><p>$225+ MRR AI workout planner</p></div>
-            </section>
-          </main>
-        </body></html>
-        """
-        detail_html = """
-        <html><head><title>FitBuild | Indie Hackers</title></head><body>
-          <main>
-            <h1>FitBuild</h1>
-            <p>Builds AI-generated training plans for busy indie hackers.</p>
-            <p>Includes onboarding flows, progress tracking, and coaching prompts.</p>
-            <a href="https://fitbuild.app">Visit website</a>
-          </main>
-        </body></html>
-        """
+        query_url = "https://N86T1R3OWZ-dsn.algolia.net/1/indexes/products/query"
         fetcher = UnifiedSourceFetcher(
             settings,
             _FakeHttpClient(
+                {"https://www.indiehackers.com/products": "<html><title>Products</title></html>"},
                 {
-                    "https://www.indiehackers.com/products": listing_html,
-                    "https://www.indiehackers.com/products/fitbuild": detail_html,
-                }
+                    "https://indie-hackers.firebaseio.com/products/fitbuild.json": {
+                        "name": "FitBuild",
+                        "tagline": "AI workout planner",
+                        "description": "Builds AI-generated training plans for busy indie hackers.",
+                        "websiteUrl": "https://fitbuild.app",
+                        "selfReportedMonthlyRevenue": 225,
+                    },
+                    "https://indie-hackers.firebaseio.com/indexes/productStats/fitbuild.json": {"numViews": 128},
+                },
+                post_json_by_url={
+                    query_url: {
+                        "hits": [
+                            {
+                                "productId": "fitbuild",
+                                "name": "FitBuild",
+                                "tagline": "AI workout planner",
+                                "description": "$225+ MRR AI workout planner",
+                                "websiteUrl": "https://fitbuild.app",
+                            }
+                        ]
+                    }
+                },
             ),
         )
         profile = SourceProfile(
@@ -240,10 +268,13 @@ class SourceParsingTests(unittest.TestCase):
         observations = fetcher.fetch(profile)
 
         self.assertEqual(len(observations), 1)
-        self.assertIn("Detail title: FitBuild | Indie Hackers", observations[0].body_text)
-        self.assertIn("Detail context: FitBuild Builds AI-generated training plans for busy indie hackers.", observations[0].body_text)
+        self.assertEqual(observations[0].source_url, "https://www.indiehackers.com/product/fitbuild")
+        self.assertIn("Detail title: FitBuild", observations[0].body_text)
+        self.assertIn("Builds AI-generated training plans for busy indie hackers.", observations[0].body_text)
+        self.assertIn("Self-reported monthly revenue: 225", observations[0].body_text)
         self.assertIn("Detail links: https://fitbuild.app", observations[0].body_text)
         self.assertEqual(observations[0].raw_payload["external_url"], "https://fitbuild.app")
+        self.assertEqual(observations[0].raw_payload["detail_num_views"], 128)
 
     def test_solo_extracts_only_topic_links(self) -> None:
         settings = self._settings()

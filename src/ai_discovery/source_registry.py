@@ -116,7 +116,7 @@ def classify_source(input_url: str, normalized_url: str, settings: Settings) -> 
             input_url,
             normalized_url,
             kind="indiehackers_products",
-            reason="Tier 1 direct source via Indie Hackers product card extraction.",
+            reason="Tier 1 direct source via Indie Hackers product directory search results.",
         )
     if host == "solo.xin":
         return _generic_profile(

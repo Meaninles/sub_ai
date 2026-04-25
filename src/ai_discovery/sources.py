@@ -5,7 +5,7 @@ import html
 from html.parser import HTMLParser
 import re
 from datetime import UTC, datetime
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 from .config import Settings
 from .http import HttpClient
@@ -58,6 +58,10 @@ _REDDIT_NOISE_TEXT = {
     "join",
     "sort by",
 }
+_INDIEHACKERS_ALGOLIA_APP_ID = "N86T1R3OWZ"
+_INDIEHACKERS_ALGOLIA_SEARCH_API_KEY = "5140dac5e87f47346abbda1a34ee70c3"
+_INDIEHACKERS_PRODUCTS_INDEX = "products"
+_INDIEHACKERS_PRODUCTS_MAX_ITEMS = 30
 
 
 class UnifiedSourceFetcher:
@@ -75,7 +79,7 @@ class UnifiedSourceFetcher:
         if profile.kind == "indiehackers_ideas":
             return self._fetch_indiehackers_section(profile, section="ideas")
         if profile.kind == "indiehackers_products":
-            return self._fetch_indiehackers_section(profile, section="products")
+            return self._fetch_indiehackers_products(profile)
         if profile.kind == "solo_topics":
             return self._fetch_structured_page(profile, _extract_solo_topic_candidates)
         if profile.kind == "generic_page":
@@ -134,6 +138,70 @@ class UnifiedSourceFetcher:
             lambda root, base_url: _extract_indiehackers_candidates(root, base_url, section=section),
             enrich_candidate=self._enrich_indiehackers_candidate,
         )
+
+    def _fetch_indiehackers_products(self, profile: SourceProfile) -> list[Observation]:
+        limit = self.settings.fetch_limit_generic if self.settings.fetch_limit_generic > 0 else _INDIEHACKERS_PRODUCTS_MAX_ITEMS
+        limit = min(limit, _INDIEHACKERS_PRODUCTS_MAX_ITEMS)
+        query_url = (
+            f"https://{_INDIEHACKERS_ALGOLIA_APP_ID}-dsn.algolia.net/1/indexes/{_INDIEHACKERS_PRODUCTS_INDEX}/query"
+        )
+        try:
+            payload = self.http_client.post_json(
+                query_url,
+                {"params": urlencode({"hitsPerPage": limit, "page": 0})},
+                headers={
+                    "X-Algolia-Application-Id": _INDIEHACKERS_ALGOLIA_APP_ID,
+                    "X-Algolia-API-Key": _INDIEHACKERS_ALGOLIA_SEARCH_API_KEY,
+                },
+                retries=1,
+            )
+        except Exception:
+            return self._fetch_generic_page(profile)
+        candidates = _extract_indiehackers_product_hits(payload)
+        observations: list[Observation] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            source_url = str(candidate["url"]).strip()
+            if not source_url or source_url in seen:
+                continue
+            seen.add(source_url)
+            title = str(candidate["title"]).strip() or profile.input_url
+            context = " ".join(str(candidate.get("context_text", "")).split())
+            enrichment = self._enrich_indiehackers_candidate(candidate)
+            body_lines = [
+                "Page title: Indie Hackers Products",
+                f"Item title: {title}",
+                f"Item URL: {source_url}",
+            ]
+            if candidate.get("external_url") and candidate["external_url"] != source_url:
+                body_lines.append(f"External URL: {candidate['external_url']}")
+            if context:
+                body_lines.append(f"Item context: {context[:1200]}")
+            body_lines.extend(
+                line for line in enrichment.get("body_lines", []) if isinstance(line, str) and line.strip()
+            )
+            external_id = hashlib.sha1(f"{profile.source_id}|{source_url}|{title}".encode("utf-8")).hexdigest()[:16]
+            observations.append(
+                Observation(
+                    source_id=profile.source_id,
+                    external_id=external_id,
+                    observed_at=datetime.now(UTC).isoformat(),
+                    title=title,
+                    body_text="\n".join(body_lines),
+                    source_url=source_url,
+                    raw_payload={
+                        "page_url": profile.normalized_url,
+                        "page_title": "Indie Hackers Products",
+                        **candidate.get("raw_payload", {}),
+                        **enrichment.get("raw_payload", {}),
+                    },
+                )
+            )
+            if len(observations) >= limit:
+                break
+        if observations:
+            return observations
+        return self._fetch_generic_page(profile)
 
     def _fetch_structured_page(
         self,
@@ -246,6 +314,11 @@ class UnifiedSourceFetcher:
         ]
 
     def _enrich_indiehackers_candidate(self, candidate: dict[str, str | dict]) -> dict[str, list[str] | dict]:
+        raw_payload = candidate.get("raw_payload", {})
+        if isinstance(raw_payload, dict):
+            product_id = str(raw_payload.get("product_id", "")).strip()
+            if product_id:
+                return self._enrich_indiehackers_product_candidate(product_id)
         detail_url = str(candidate.get("url", "")).strip()
         if not detail_url:
             return {}
@@ -278,6 +351,54 @@ class UnifiedSourceFetcher:
         if preferred_external:
             raw_payload["external_url"] = preferred_external
         return {"body_lines": body_lines, "raw_payload": raw_payload}
+
+    def _enrich_indiehackers_product_candidate(self, product_id: str) -> dict[str, list[str] | dict]:
+        detail_url = _indiehackers_product_detail_url(product_id)
+        try:
+            product_payload = self.http_client.get_json(f"https://indie-hackers.firebaseio.com/products/{product_id}.json")
+        except Exception:
+            return {}
+        if not isinstance(product_payload, dict) or not product_payload:
+            return {}
+        try:
+            stats_payload = self.http_client.get_json(
+                f"https://indie-hackers.firebaseio.com/indexes/productStats/{product_id}.json"
+            )
+        except Exception:
+            stats_payload = {}
+        detail_title = str(product_payload.get("name", "") or "").strip()
+        tagline = str(product_payload.get("tagline", "") or "").strip()
+        description = str(product_payload.get("description", "") or "").strip()
+        website_url = str(product_payload.get("websiteUrl", "") or "").strip()
+        social_links = _indiehackers_product_external_links(product_payload)
+        detail_parts = [detail_title, tagline, description]
+        self_reported_revenue = product_payload.get("selfReportedMonthlyRevenue")
+        if isinstance(self_reported_revenue, (int, float)):
+            detail_parts.append(f"Self-reported monthly revenue: {int(self_reported_revenue)}")
+        num_views = stats_payload.get("numViews") if isinstance(stats_payload, dict) else None
+        if isinstance(num_views, int):
+            detail_parts.append(f"Views: {num_views}")
+        detail_text = " ".join(part for part in detail_parts if part).strip()
+        body_lines: list[str] = []
+        if detail_title:
+            body_lines.append(f"Detail title: {detail_title}")
+        if detail_text:
+            body_lines.append(f"Detail context: {detail_text[:2000]}")
+        if social_links:
+            body_lines.append(f"Detail links: {' | '.join(social_links[:5])}")
+        raw_payload_out: dict[str, str | int | list[str]] = {
+            "detail_url": detail_url,
+            "detail_page_title": detail_title,
+            "detail_text_excerpt": detail_text[:4000],
+            "detail_external_links": social_links[:8],
+        }
+        if website_url:
+            raw_payload_out["external_url"] = website_url
+        if isinstance(self_reported_revenue, (int, float)):
+            raw_payload_out["self_reported_monthly_revenue"] = int(self_reported_revenue)
+        if isinstance(num_views, int):
+            raw_payload_out["detail_num_views"] = num_views
+        return {"body_lines": body_lines, "raw_payload": raw_payload_out}
 
     def _enrich_github_trending_candidate(self, candidate: dict[str, str | dict]) -> dict[str, list[str] | dict]:
         raw_payload = candidate.get("raw_payload", {})
@@ -454,6 +575,39 @@ def _extract_indiehackers_candidates(root: "HtmlNode", base_url: str, *, section
                 },
             }
         )
+    return candidates
+
+
+def _extract_indiehackers_product_hits(payload: dict) -> list[dict[str, str | dict]]:
+    hits = payload.get("hits", []) if isinstance(payload, dict) else []
+    candidates: list[dict[str, str | dict]] = []
+    seen: set[str] = set()
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        product_id = str(hit.get("productId") or hit.get("objectID") or "").strip()
+        if not product_id or product_id in seen:
+            continue
+        name = str(hit.get("name", "") or "").strip()
+        tagline = str(hit.get("tagline", "") or "").strip()
+        description = str(hit.get("description", "") or "").strip()
+        website_url = str(hit.get("websiteUrl", "") or "").strip()
+        context_parts = [part for part in (tagline, description) if part]
+        candidates.append(
+            {
+                "title": name or product_id,
+                "url": _indiehackers_product_detail_url(product_id),
+                "external_url": website_url,
+                "context_text": " ".join(context_parts).strip(),
+                "raw_payload": {
+                    "item_kind": "indiehackers_products",
+                    "product_id": product_id,
+                    "detail_url": _indiehackers_product_detail_url(product_id),
+                    "algolia_index": _INDIEHACKERS_PRODUCTS_INDEX,
+                },
+            }
+        )
+        seen.add(product_id)
     return candidates
 
 
@@ -720,6 +874,24 @@ def _normalize_url(url: str) -> str:
     parsed = urlparse(url)
     path = parsed.path or "/"
     return parsed._replace(fragment="").geturl().replace("#", "")
+
+
+def _indiehackers_product_detail_url(product_id: str) -> str:
+    return f"https://www.indiehackers.com/product/{product_id.strip()}"
+
+
+def _indiehackers_product_external_links(product_payload: dict) -> list[str]:
+    links: list[str] = []
+    website_url = str(product_payload.get("websiteUrl", "") or "").strip()
+    if website_url:
+        links.append(website_url)
+    twitter_handle = str(product_payload.get("twitterHandle", "") or "").strip().lstrip("@")
+    if twitter_handle:
+        links.append(f"https://twitter.com/{twitter_handle}")
+    facebook_url = str(product_payload.get("facebookUrl", "") or "").strip()
+    if facebook_url:
+        links.append(facebook_url)
+    return links
 
 
 def _strip_tags(value: str) -> str:
