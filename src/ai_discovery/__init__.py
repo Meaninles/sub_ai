@@ -1,0 +1,2 @@
+"""AI project discovery MVP."""
+

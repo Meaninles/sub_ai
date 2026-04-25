@@ -1,0 +1,7 @@
+.git
+.venv
+.pytest_cache
+__pycache__
+.omx/data
+tests/__pycache__
+src/ai_discovery/__pycache__
